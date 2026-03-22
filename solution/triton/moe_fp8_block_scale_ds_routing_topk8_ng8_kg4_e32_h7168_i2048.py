@@ -26,6 +26,7 @@ def kernel(
     gemm2_weights_scale: torch.Tensor,
     local_expert_offset: int,
     routed_scaling_factor: float,
+    output: torch.Tensor,
 ):
     """
     • FP8 block-scale dequantization: float ≈ fp8 * scale
@@ -139,7 +140,9 @@ def kernel(
     weights = (weights / weights_sum) * routed_scaling_factor  # [T, E]
 
     # 3) Local expert compute and accumulation
-    output = torch.zeros((T, H), dtype=torch.float32, device=device)
+    # Use the pre-allocated output tensor (destination-passing style)
+    output.zero_()
+    temp_output = torch.zeros((T, H), dtype=torch.float32, device=device)
 
     local_start = int(local_expert_offset)
 
@@ -176,7 +179,8 @@ def kernel(
 
         # Accumulate with per-token routing weights for this expert
         w_tok = weights.index_select(0, token_idx)[:, ge]      # [Tk]
-        output.index_add_(0, token_idx, O * w_tok.unsqueeze(1))  # [Tk,H] * [Tk,1]
+        temp_output.index_add_(0, token_idx, O * w_tok.unsqueeze(1))  # [Tk,H] * [Tk,1]
 
-    return output.to(torch.bfloat16)
+    # Write to the pre-allocated output tensor (destination-passing style)
+    output.copy_(temp_output.to(torch.bfloat16))
 
