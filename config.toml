@@ -7,3 +7,4 @@ path = "./solution"
 [build]
 language = "triton"               # triton | cuda
 entry_point = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.py::kernel"            # Kernel function name
+destination_passing_style = true  # Use destination-passing style (default: true)
