@@ -1,5 +1,5 @@
 [solution]
-name = "solution-v2"      # Solution name
+name = "solution-v3"      # Solution name
 definition = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048"
 author = "whatdhack"              # Team/author name
 path = "./solution"
@@ -7,5 +7,6 @@ path = "./solution"
 [build]
 language = "triton"               # triton | cuda
 #entry_point = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.py::kernel"    
-entry_point = "moe_fp8_kernel_helion.py::kernel"          # Kernel function name
+#entry_point = "moe_fp8bf16_local_e_dq.py::kernel"          # Kernel function name
+entry_point = "moe_fp8fpX_fused.py::kernel"
 destination_passing_style = true  # Use destination-passing style (default: true)
