@@ -800,6 +800,8 @@ def main():
     parser.add_argument("--benchmark", action="store_true", help="Run benchmarking")
     parser.add_argument("--iterations", type=int, default=10)
     parser.add_argument("--warmup", type=int, default=3, help="Number of warmup iterations")
+    parser.add_argument("--profile", action="store_true", help="Run Kineto profiler on one kernel call")
+    parser.add_argument("--profile-dir", type=str, default="./profiles", help="Directory to save Kineto trace JSON")
     parser.add_argument(
         "--act-dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"],
         help="Activation dequantization dtype (dequantize_fp8_activations_xx)"
@@ -930,6 +932,52 @@ def main():
         print(f"  Total time: {elapsed_ms:.3f} ms")
         print(f"  Average time: {avg_time_ms:.3f} ms")
 
+        # Kineto profiling
+        if args.profile:
+            from torch.profiler import profile, record_function, ProfilerActivity
+            from datetime import datetime
+            import re
+
+            profile_dir = Path(args.profile_dir)
+            profile_dir.mkdir(parents=True, exist_ok=True)
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            trace_name = f"moe_fp8fpX_at_{args.act_dtype}_ct_{args.compute_dtype}_wl{wl_idx}_{ts}"
+            trace_path = profile_dir / f"{trace_name}.json"
+
+            _prof_warmup = 17
+            _prof_active = 3
+            print(f"\nRunning Kineto profiler ({_prof_warmup} warmup + {_prof_active} captured iters)...")
+            for _ in range(_prof_warmup):
+                kernel(**inputs, **kernel_kwargs)
+            torch.cuda.synchronize()
+
+            with profile(
+                activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
+                record_shapes=True,
+                with_stack=False,
+                acc_events=True,
+            ) as prof:
+                for i in range(_prof_active):
+                    with record_function(f"iteration {i+_prof_warmup}"):
+                        kernel(**inputs, **kernel_kwargs)
+                torch.cuda.synchronize()
+
+            prof.export_chrome_trace(str(trace_path))
+            print(f"  Chrome trace saved: {trace_path}")
+            print(f"  Open with: https://ui.perfetto.dev  or  chrome://tracing")
+
+            print("\nTop 20 ops by CUDA time (self):")
+            key_avgs = prof.key_averages()
+            print(key_avgs.table(sort_by="self_device_time_total", row_limit=20))
+
+            table_str = key_avgs.table(sort_by="self_device_time_total", row_limit=0)
+            cpu_m  = re.search(r"Self CPU time total:\s*([\d.]+)(m?s)", table_str)
+            cuda_m = re.search(r"Self CUDA time total:\s*([\d.]+)(m?s)", table_str)
+            def _to_ms(val, unit): return float(val) if unit == 'ms' else float(val) / 1e3
+            if cpu_m and cuda_m:
+                print(f"{'TOTAL (self)':>55}  {_to_ms(cpu_m.group(1), cpu_m.group(2)):>12.3f}ms"
+                      f"  {_to_ms(cuda_m.group(1), cuda_m.group(2)):>12.3f}ms")
+
     print(f"\nOutput shape: {output.shape} ({output.dtype})")
     print(f"Output stats:")
     print(f"  Min: {output.min().item():.6f}")
@@ -941,7 +989,7 @@ def main():
     print("NEXT STEPS:")
     print("="*80)
     print("1. Run profiling on original kernel:")
-    print("   python moe_fp8bf16_local_e_dq.py --profile")
+    print("   python moe_fp8fpX_fused.py --profile")
     print("")
     print("2. Implement Helion kernel for expert_computation_helion()")
     print("   - Use hl.grid() to parallelize over token-expert pairs")
