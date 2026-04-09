@@ -214,9 +214,9 @@ def expert_computation_bf16(
     for le_int, W13_e in W13.items():
         ge = local_start + le_int
         sel_mask = (topk_idx == ge).any(dim=1)
-        if not sel_mask.any():
+        token_idx = sel_mask.nonzero(as_tuple=False).squeeze(1)
+        if token_idx.numel() == 0:  # CPU-side check — no additional GPU sync
             continue
-        token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
         A_e  = A.index_select(0, token_idx).to(torch.bfloat16)
         W13_e = W13_e.to(torch.bfloat16)
         W2_e  = W2[le_int].to(torch.bfloat16)
@@ -251,9 +251,9 @@ def expert_computation_fp16(
     for le_int, W13_e in W13.items():
         ge = local_start + le_int
         sel_mask = (topk_idx == ge).any(dim=1)
-        if not sel_mask.any():
+        token_idx = sel_mask.nonzero(as_tuple=False).squeeze(1)
+        if token_idx.numel() == 0:  # CPU-side check — no additional GPU sync
             continue
-        token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
         A_e  = A.index_select(0, token_idx).to(torch.float16)
         W13_e = W13_e.to(torch.float16)
         W2_e  = W2[le_int].to(torch.float16)
@@ -290,9 +290,9 @@ def expert_computation_fp32(
     for le_int, W13_e in W13.items():
         ge = local_start + le_int
         sel_mask = (topk_idx == ge).any(dim=1)
-        if not sel_mask.any():
+        token_idx = sel_mask.nonzero(as_tuple=False).squeeze(1)
+        if token_idx.numel() == 0:  # CPU-side check — no additional GPU sync
             continue
-        token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
         A_e  = A.index_select(0, token_idx).to(torch.float32)
         W13_e = W13_e.to(torch.float32)
         W2_e  = W2[le_int].to(torch.float32)
@@ -330,9 +330,9 @@ def expert_computation_tf32(
     for le_int, W13_e in W13.items():
         ge = local_start + le_int
         sel_mask = (topk_idx == ge).any(dim=1)
-        if not sel_mask.any():
+        token_idx = sel_mask.nonzero(as_tuple=False).squeeze(1)
+        if token_idx.numel() == 0:  # CPU-side check — no additional GPU sync
             continue
-        token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
         A_e  = A.index_select(0, token_idx).to(torch.float32)
         W13_e = W13_e.to(torch.float32)
         W2_e  = W2[le_int].to(torch.float32)
@@ -382,12 +382,12 @@ hconfig_fp32 = helion.Config(
 @helion.kernel(config=hconfig_fp32, static_shapes=True)
 def _helion_fp8_gemm_fp32(
     A: torch.Tensor,       # [M, K]      fp32 activations
-    W_t: torch.Tensor,     # [K, N]      fp8_e4m3 weights, pre-transposed contiguous
+    W_t: torch.Tensor,     # [K, N]      fp8_e4m3 weights, transposed (may be non-contiguous)
     S_kexp: torch.Tensor,  # [K//128, N] scales pre-expanded on N dim
 ) -> torch.Tensor:
     """
     Fused FP8-dequant GEMM: C = A @ W_t  (fp32 accumulation, TF32 off).
-    - W is stored [K, N] so the inner tile is W_t[tile_k, tile_n] — no .T needed.
+    - W is stored [K, N] (transposed view, possibly non-contiguous) so the inner tile is W_t[tile_k, tile_n].
     - Scale is [K//128, N]: for each K-tile, one row of scales covers all N columns.
     - tile_k.begin // 128 selects the correct scale row.
     """
@@ -427,7 +427,7 @@ hconfig_tf32 = helion.Config(
 @helion.kernel(config=hconfig_tf32, static_shapes=True)
 def _helion_fp8_gemm_tf32(
     A: torch.Tensor,       # [M, K]      fp32 activations
-    W_t: torch.Tensor,     # [K, N]      fp8_e4m3 weights, pre-transposed contiguous
+    W_t: torch.Tensor,     # [K, N]      fp8_e4m3 weights, transposed (may be non-contiguous)
     S_kexp: torch.Tensor,  # [K//128, N] scales pre-expanded on N dim
 ) -> torch.Tensor:
     """
@@ -478,23 +478,37 @@ def expert_computation_helion_fp32(
 
     temp_output = torch.zeros((T, H), dtype=torch.float32, device=device)
 
+    # Pre-sort tokens by expert: one GPU sync (expert_offsets.cpu()) instead of
+    # one sync per expert (nonzero).  sorted_token_ids[start:end] is a GPU view.
+    TOP_K = topk_idx.shape[1]
+    token_ids_flat = torch.arange(T, device=device).unsqueeze(1).expand(-1, TOP_K).reshape(-1)
+    expert_ids_flat = topk_idx.reshape(-1)
+    sort_order = expert_ids_flat.argsort(stable=True)
+    sorted_token_ids = token_ids_flat[sort_order]           # [T*TOP_K] GPU
+    sorted_expert_ids = expert_ids_flat[sort_order]         # [T*TOP_K] GPU
+    expert_counts = torch.bincount(sorted_expert_ids, minlength=E_global)  # [E_global]
+    expert_offsets_gpu = torch.zeros(E_global + 1, dtype=torch.long, device=device)
+    expert_offsets_gpu[1:] = expert_counts.cumsum(0)
+    expert_offsets = expert_offsets_gpu.cpu()               # ONE sync — all boundaries on CPU
+
     for le_int, W13_e in W13_fp8.items():
         ge = local_start + le_int
-        sel_mask = (topk_idx == ge).any(dim=1)
-        if not sel_mask.any():
+        start = int(expert_offsets[ge])
+        end   = int(expert_offsets[ge + 1])
+        if start == end:
             continue
-        token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
+        token_idx = sorted_token_ids[start:end]             # GPU slice, no sync
         A_e = A.index_select(0, token_idx).to(torch.float32)  # [Te, H]
 
-        # Pre-transpose W: [N, K] → [K, N] contiguous (avoids in-kernel .T)
+        # Transpose W: [N, K] → [K, N] non-contiguous view (no copy, Helion handles strides)
         # S_kexp shape must be [K//128, N]:
         #   W13_scale[le]: [N//128, K//128] = [32, 56]
         #     .T → [56, 32], repeat_interleave(128, dim=1) → [56, 4096] = [K//128, N] ✓
         #   W2_scale[le]:  [N//128, K//128] = [56, 16]
         #     .T → [16, 56], repeat_interleave(128, dim=1) → [16, 7168] = [K//128, N] ✓
-        W13_t = W13_e.T.contiguous()                                                   # [H, 2*I] fp8
+        W13_t = W13_e.T                                                                # [H, 2*I] fp8, col-major
         S13   = torch.repeat_interleave(W13_scale[le_int].T.contiguous(), 128, dim=1) # [H//128, 2*I]
-        W2_t  = W2_fp8[le_int].T.contiguous()                                         # [I, H]   fp8
+        W2_t  = W2_fp8[le_int].T                                                      # [I, H]   fp8, col-major
         S2    = torch.repeat_interleave(W2_scale[le_int].T.contiguous(), 128, dim=1)  # [I//128, H]
 
         # GEMM1: fused FP8-dequant, no fp32 W13 materialised in global memory
@@ -538,17 +552,30 @@ def expert_computation_helion_tf32(
 
     temp_output = torch.zeros((T, H), dtype=torch.float32, device=device)
 
+    # Pre-sort tokens by expert: one GPU sync instead of one per expert.
+    TOP_K = topk_idx.shape[1]
+    token_ids_flat = torch.arange(T, device=device).unsqueeze(1).expand(-1, TOP_K).reshape(-1)
+    expert_ids_flat = topk_idx.reshape(-1)
+    sort_order = expert_ids_flat.argsort(stable=True)
+    sorted_token_ids = token_ids_flat[sort_order]
+    sorted_expert_ids = expert_ids_flat[sort_order]
+    expert_counts = torch.bincount(sorted_expert_ids, minlength=E_global)
+    expert_offsets_gpu = torch.zeros(E_global + 1, dtype=torch.long, device=device)
+    expert_offsets_gpu[1:] = expert_counts.cumsum(0)
+    expert_offsets = expert_offsets_gpu.cpu()               # ONE sync
+
     for le_int, W13_e in W13_fp8.items():
         ge = local_start + le_int
-        sel_mask = (topk_idx == ge).any(dim=1)
-        if not sel_mask.any():
+        start = int(expert_offsets[ge])
+        end   = int(expert_offsets[ge + 1])
+        if start == end:
             continue
-        token_idx = torch.nonzero(sel_mask, as_tuple=False).squeeze(1)
+        token_idx = sorted_token_ids[start:end]             # GPU slice, no sync
         A_e = A.index_select(0, token_idx).to(torch.float32)
 
-        W13_t = W13_e.T.contiguous()
+        W13_t = W13_e.T
         S13   = torch.repeat_interleave(W13_scale[le_int].T.contiguous(), 128, dim=1)
-        W2_t  = W2_fp8[le_int].T.contiguous()
+        W2_t  = W2_fp8[le_int].T
         S2    = torch.repeat_interleave(W2_scale[le_int].T.contiguous(), 128, dim=1)
 
         G1  = _helion_fp8_gemm_tf32(A_e, W13_t, S13)
@@ -648,7 +675,7 @@ def kernel(
 
     # Resolve dispatch functions at call time (supports monkey-patching)
     act_dequant_fn = getattr(_mod, f'dequantize_fp8_activations_{act_dtype}')
-    expert_fn = getattr(_mod, f'expert_computation_{compute_dtype}')
+    expert_computation = getattr(_mod, f'expert_computation_{compute_dtype}')
     weight_dtype = _WEIGHT_DTYPE_MAP[compute_dtype]
     # Fused dtypes skip host-side weight dequant; no weight_dequant_fn needed
     if compute_dtype not in _FUSED_COMPUTE_DTYPES:
@@ -695,7 +722,7 @@ def kernel(
             W2_fp8_dict[le_int]    = gemm2_weights[le_int]        # [H, I]    fp8
             W2_scale_dict[le_int]  = gemm2_weights_scale[le_int]  # [H//128, I//128]
 
-        temp_output = expert_fn(
+        temp_output = expert_computation(
             A, W13_fp8_dict, W13_scale_dict, W2_fp8_dict, W2_scale_dict,
             topk_idx, weights, local_expert_offset, E_global,
         )
@@ -716,7 +743,7 @@ def kernel(
                 BLOCK
             )[0]
 
-        temp_output = expert_fn(
+        temp_output = expert_computation(
             A, W13_dict, W2_dict, topk_idx, weights,
             local_expert_offset, E_global,
         )
