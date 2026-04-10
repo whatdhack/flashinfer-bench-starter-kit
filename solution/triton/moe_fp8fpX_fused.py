@@ -489,35 +489,35 @@ def expert_computation_helion_fp32(
     expert_counts = torch.bincount(sorted_expert_ids, minlength=E_global)  # [E_global]
     expert_offsets_gpu = torch.zeros(E_global + 1, dtype=torch.long, device=device)
     expert_offsets_gpu[1:] = expert_counts.cumsum(0)
-    expert_offsets = expert_offsets_gpu.cpu()               # ONE sync — all boundaries on CPU
+    # .tolist() = one sync + one transfer; indexing a Python list has zero C++ dispatch
+    expert_offsets_list = expert_offsets_gpu.cpu().tolist()
+
+    # Precompute scale tensors (constant across calls, no per-expert sync)
+    # S_kexp shape must be [K//128, N]:
+    #   W13_scale[le]: [N//128, K//128] → .T → repeat_interleave(128, dim=1) → [K//128, N]
+    #   W2_scale[le]:  [N//128, K//128] → .T → repeat_interleave(128, dim=1) → [K//128, N]
+    S13_cache = {le: torch.repeat_interleave(s.T.contiguous(), 128, dim=1) for le, s in W13_scale.items()}
+    S2_cache  = {le: torch.repeat_interleave(s.T.contiguous(), 128, dim=1) for le, s in W2_scale.items()}
 
     for le_int, W13_e in W13_fp8.items():
         ge = local_start + le_int
-        start = int(expert_offsets[ge])
-        end   = int(expert_offsets[ge + 1])
+        start = expert_offsets_list[ge]
+        end   = expert_offsets_list[ge + 1]
         if start == end:
             continue
         token_idx = sorted_token_ids[start:end]             # GPU slice, no sync
         A_e = A.index_select(0, token_idx).to(torch.float32)  # [Te, H]
 
-        # Transpose W: [N, K] → [K, N] non-contiguous view (no copy, Helion handles strides)
-        # S_kexp shape must be [K//128, N]:
-        #   W13_scale[le]: [N//128, K//128] = [32, 56]
-        #     .T → [56, 32], repeat_interleave(128, dim=1) → [56, 4096] = [K//128, N] ✓
-        #   W2_scale[le]:  [N//128, K//128] = [56, 16]
-        #     .T → [16, 56], repeat_interleave(128, dim=1) → [16, 7168] = [K//128, N] ✓
-        W13_t = W13_e.T                                                                # [H, 2*I] fp8, col-major
-        S13   = torch.repeat_interleave(W13_scale[le_int].T.contiguous(), 128, dim=1) # [H//128, 2*I]
-        W2_t  = W2_fp8[le_int].T                                                      # [I, H]   fp8, col-major
-        S2    = torch.repeat_interleave(W2_scale[le_int].T.contiguous(), 128, dim=1)  # [I//128, H]
+        W13_t = W13_e.T                     # [H, 2*I] fp8, col-major, no copy
+        W2_t  = W2_fp8[le_int].T            # [I, H]   fp8, col-major, no copy
 
         # GEMM1: fused FP8-dequant, no fp32 W13 materialised in global memory
-        G1 = _helion_fp8_gemm_fp32(A_e, W13_t, S13)   # [Te, 2*I]
+        G1 = _helion_fp8_gemm_fp32(A_e, W13_t, S13_cache[le_int])   # [Te, 2*I]
         X1, X2 = G1[:, :I], G1[:, I:]
         C_e = (X2 / (1.0 + torch.exp(-X2))) * X1       # SwiGLU [Te, I]
 
         # GEMM2: fused FP8-dequant
-        O = _helion_fp8_gemm_fp32(C_e, W2_t, S2)       # [Te, H]
+        O = _helion_fp8_gemm_fp32(C_e, W2_t, S2_cache[le_int])       # [Te, H]
 
         w_tok = weights.index_select(0, token_idx)[:, ge]
         temp_output.index_add_(0, token_idx, O * w_tok.unsqueeze(1))
@@ -562,27 +562,28 @@ def expert_computation_helion_tf32(
     expert_counts = torch.bincount(sorted_expert_ids, minlength=E_global)
     expert_offsets_gpu = torch.zeros(E_global + 1, dtype=torch.long, device=device)
     expert_offsets_gpu[1:] = expert_counts.cumsum(0)
-    expert_offsets = expert_offsets_gpu.cpu()               # ONE sync
+    expert_offsets_list = expert_offsets_gpu.cpu().tolist()  # one sync, Python list = zero dispatch
+
+    S13_cache = {le: torch.repeat_interleave(s.T.contiguous(), 128, dim=1) for le, s in W13_scale.items()}
+    S2_cache  = {le: torch.repeat_interleave(s.T.contiguous(), 128, dim=1) for le, s in W2_scale.items()}
 
     for le_int, W13_e in W13_fp8.items():
         ge = local_start + le_int
-        start = int(expert_offsets[ge])
-        end   = int(expert_offsets[ge + 1])
+        start = expert_offsets_list[ge]
+        end   = expert_offsets_list[ge + 1]
         if start == end:
             continue
         token_idx = sorted_token_ids[start:end]             # GPU slice, no sync
         A_e = A.index_select(0, token_idx).to(torch.float32)
 
         W13_t = W13_e.T
-        S13   = torch.repeat_interleave(W13_scale[le_int].T.contiguous(), 128, dim=1)
         W2_t  = W2_fp8[le_int].T
-        S2    = torch.repeat_interleave(W2_scale[le_int].T.contiguous(), 128, dim=1)
 
-        G1  = _helion_fp8_gemm_tf32(A_e, W13_t, S13)
+        G1  = _helion_fp8_gemm_tf32(A_e, W13_t, S13_cache[le_int])
         X1, X2 = G1[:, :I], G1[:, I:]
         C_e = (X2 / (1.0 + torch.exp(-X2))) * X1
 
-        O = _helion_fp8_gemm_tf32(C_e, W2_t, S2)
+        O = _helion_fp8_gemm_tf32(C_e, W2_t, S2_cache[le_int])
 
         w_tok = weights.index_select(0, token_idx)[:, ge]
         temp_output.index_add_(0, token_idx, O * w_tok.unsqueeze(1))
