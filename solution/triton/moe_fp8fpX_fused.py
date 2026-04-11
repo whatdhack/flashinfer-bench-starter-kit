@@ -17,6 +17,9 @@ import os
 from pathlib import Path
 from safetensors import safe_open
 
+# Set MOE_DEBUG=1 or pass --debug to enable diagnostic prints.
+_DEBUG = os.environ.get("MOE_DEBUG", "0") == "1"
+
 import helion
 import helion.language as hl
 
@@ -452,6 +455,87 @@ def _helion_fp8_gemm_tf32(
     return C
 
 
+# Autotune config — regenerate with config=None on first run.
+# block_sizes covers only the two free outer tiles (tile_m, tile_n);
+# tile_k and tile_h are fixed at 128 to match the fp8 scale block size.
+hconfig_swiglu_fp32 = helion.Config(
+    block_sizes=[32, 128],
+    # 8 load/store ops: A, W13_val, S13_val, W13_gate, S13_gate, W2, S2, O(store)
+    indexing=['pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer', 'pointer'],
+    l2_groupings=[1],
+    # 7 load eviction policies (loads only, not the store)
+    load_eviction_policies=['', '', '', '', '', '', ''],
+    loop_orders=[[0, 1]],
+    num_stages=3,
+    num_warps=4,
+    pid_type='flat',
+    range_flattens=[None, False, False],
+    range_multi_buffers=[None, None, None],
+    range_num_stages=[0, 0, 0],
+    range_unroll_factors=[0, 0, 0],
+    range_warp_specializes=[None, False, False],
+)
+@helion.kernel(config=hconfig_swiglu_fp32, static_shapes=True)
+def _helion_fp8_swiglu_fused_fp32(
+    A: torch.Tensor,             # [Te, H]       fp32 activations
+    W13_val_t: torch.Tensor,     # [H,  I]       fp8_e4m3, value half of W13, transposed
+    S13_val_kexp: torch.Tensor,  # [H//128, I]   fp32 scales pre-expanded
+    W13_gate_t: torch.Tensor,    # [H,  I]       fp8_e4m3, gate half of W13, transposed
+    S13_gate_kexp: torch.Tensor, # [H//128, I]   fp32 scales pre-expanded
+    W2_t: torch.Tensor,          # [I,  H_out]   fp8_e4m3, transposed
+    S2_kexp: torch.Tensor,       # [I//128, H_out] fp32 scales pre-expanded
+) -> torch.Tensor:               # [Te, H_out]   fp32
+    """
+    Fused: O = (A @ W13_val_t * silu(A @ W13_gate_t)) @ W2_t  (fp32, no TF32).
+
+    W13 is pre-split by the caller into val [H, I] and gate [H, I] halves to avoid
+    tile+offset indexing (which produces wrong shapes in Helion's Triton codegen).
+
+    Tiles over (Te, H_out); reduces I without writing the [Te, I] intermediates to
+    global memory.  Per 128-wide tile_k of I:
+      1. Accumulate both GEMM1 halves over the H dimension on-chip.
+      2. Apply SwiGLU.
+      3. Dot into the output accumulator for GEMM2.
+    """
+    Te, H = A.shape
+    I = W2_t.shape[0]
+    H_out = W2_t.shape[1]
+    O = torch.empty([Te, H_out], dtype=torch.float32, device=A.device)
+
+    for tile_m, tile_n in hl.tile([Te, H_out]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+
+        for tile_k in hl.tile(I, block_size=128):
+            # --- GEMM1: accumulate val and gate halves on-chip ---
+            g1_val  = hl.zeros([tile_m, tile_k], dtype=torch.float32)
+            g1_gate = hl.zeros([tile_m, tile_k], dtype=torch.float32)
+
+            for tile_h in hl.tile(H, block_size=128):
+                a_tile = A[tile_m, tile_h]                               # [bM, 128] fp32
+                h_s    = tile_h.begin // 128                             # H-block → scale row
+
+                w13_val  = W13_val_t[tile_h, tile_k]                     # [128, bK] fp8
+                s13_val  = S13_val_kexp[h_s : h_s + 1, tile_k]          # [1,   bK] fp32
+                g1_val   = hl.dot(a_tile, w13_val.to(torch.float32) * s13_val, acc=g1_val)
+
+                w13_gate = W13_gate_t[tile_h, tile_k]                    # [128, bK] fp8
+                s13_gate = S13_gate_kexp[h_s : h_s + 1, tile_k]         # [1,   bK] fp32
+                g1_gate  = hl.dot(a_tile, w13_gate.to(torch.float32) * s13_gate, acc=g1_gate)
+
+            # --- SwiGLU ---
+            c_e = (g1_gate / (1.0 + torch.exp(-g1_gate))) * g1_val      # [bM, bK]
+
+            # --- GEMM2 ---
+            k_s2 = tile_k.begin // 128                                   # I-block → scale row
+            w2   = W2_t[tile_k, tile_n]                                  # [bK, bN] fp8
+            s2   = S2_kexp[k_s2 : k_s2 + 1, tile_n]                     # [1,  bN] fp32
+            acc  = hl.dot(c_e, w2.to(torch.float32) * s2, acc=acc)
+
+        O[tile_m, tile_n] = acc
+
+    return O
+
+
 @torch.no_grad()
 def expert_computation_helion_fp32(
     A: torch.Tensor,              # [T, H]  fp32 activations (already dequantized)
@@ -469,7 +553,6 @@ def expert_computation_helion_fp32(
     Replaces the separate weight_dequant → expert_computation_fp32 pair.
     """
     T, H = A.shape
-    I = next(iter(W2_fp8.values())).shape[1]
     device = A.device
     local_start = int(local_expert_offset)
 
@@ -508,16 +591,19 @@ def expert_computation_helion_fp32(
         token_idx = sorted_token_ids[start:end]             # GPU slice, no sync
         A_e = A.index_select(0, token_idx).to(torch.float32)  # [Te, H]
 
-        W13_t = W13_e.T                     # [H, 2*I] fp8, col-major, no copy
-        W2_t  = W2_fp8[le_int].T            # [I, H]   fp8, col-major, no copy
+        I = W2_fp8[le_int].shape[1]
+        W13_t      = W13_e.T                         # [H, 2*I] fp8, non-contiguous view
+        W13_val_t  = W13_t[:, :I]                    # [H, I]   fp8, no copy
+        W13_gate_t = W13_t[:, I:]                    # [H, I]   fp8, no copy
+        W2_t       = W2_fp8[le_int].T                # [I, H]   fp8, non-contiguous view
+        S13_kexp     = S13_cache[le_int]             # [H//128, 2*I]
+        S13_val_kexp  = S13_kexp[:, :I]              # [H//128, I] no copy
+        S13_gate_kexp = S13_kexp[:, I:]              # [H//128, I] no copy
 
-        # GEMM1: fused FP8-dequant, no fp32 W13 materialised in global memory
-        G1 = _helion_fp8_gemm_fp32(A_e, W13_t, S13_cache[le_int])   # [Te, 2*I]
-        X1, X2 = G1[:, :I], G1[:, I:]
-        C_e = (X2 / (1.0 + torch.exp(-X2))) * X1       # SwiGLU [Te, I]
-
-        # GEMM2: fused FP8-dequant
-        O = _helion_fp8_gemm_fp32(C_e, W2_t, S2_cache[le_int])       # [Te, H]
+        # Fused GEMM1 + SwiGLU + GEMM2: no [Te, I] intermediate in global memory
+        O = _helion_fp8_swiglu_fused_fp32(
+            A_e, W13_val_t, S13_val_kexp, W13_gate_t, S13_gate_kexp, W2_t, S2_cache[le_int]
+        )
 
         w_tok = weights.index_select(0, token_idx)[:, ge]
         temp_output.index_add_(0, token_idx, O * w_tok.unsqueeze(1))
@@ -653,18 +739,19 @@ def kernel(
     import sys
     _mod = sys.modules[__name__]
 
-    print(f"act_dtype={act_dtype}, compute_dtype={compute_dtype}")
-    print(f"routing_logits shape: {routing_logits.shape} ({routing_logits.dtype})")
-    print(f"routing_bias shape: {routing_bias.shape} ({routing_bias.dtype})")
-    print(f"hidden_states shape: {hidden_states.shape} ({hidden_states.dtype})")
-    print(f"hidden_states_scale shape: {hidden_states_scale.shape} ({hidden_states_scale.dtype})")
-    print(f"gemm1_weights shape: {gemm1_weights.shape} ({gemm1_weights.dtype})")
-    print(f"gemm1_weights_scale shape: {gemm1_weights_scale.shape} ({gemm1_weights_scale.dtype})")
-    print(f"gemm2_weights shape: {gemm2_weights.shape} ({gemm2_weights.dtype})")
-    print(f"gemm2_weights_scale shape: {gemm2_weights_scale.shape} ({gemm2_weights_scale.dtype})")
-    print(f"local_expert_offset: {local_expert_offset}")
-    print(f"routed_scaling_factor: {routed_scaling_factor}")
-    print(f"output shape: {output.shape} ({output.dtype})")
+    if _DEBUG:
+        print(f"act_dtype={act_dtype}, compute_dtype={compute_dtype}")
+        print(f"routing_logits shape: {routing_logits.shape} ({routing_logits.dtype})")
+        print(f"routing_bias shape: {routing_bias.shape} ({routing_bias.dtype})")
+        print(f"hidden_states shape: {hidden_states.shape} ({hidden_states.dtype})")
+        print(f"hidden_states_scale shape: {hidden_states_scale.shape} ({hidden_states_scale.dtype})")
+        print(f"gemm1_weights shape: {gemm1_weights.shape} ({gemm1_weights.dtype})")
+        print(f"gemm1_weights_scale shape: {gemm1_weights_scale.shape} ({gemm1_weights_scale.dtype})")
+        print(f"gemm2_weights shape: {gemm2_weights.shape} ({gemm2_weights.dtype})")
+        print(f"gemm2_weights_scale shape: {gemm2_weights_scale.shape} ({gemm2_weights_scale.dtype})")
+        print(f"local_expert_offset: {local_expert_offset}")
+        print(f"routed_scaling_factor: {routed_scaling_factor}")
+        print(f"output shape: {output.shape} ({output.dtype})")
 
     # Constants
     H = 7168
@@ -685,6 +772,8 @@ def kernel(
 
     # Phase 1a: Dequantize activations FP8 → act_dtype
     A = act_dequant_fn(hidden_states, hidden_states_scale, BLOCK)
+    if _DEBUG:
+        print(f"A dtype: {A.dtype}, shape: {A.shape}")
 
     # Phase 2: Routing (Host-side) — keep in FP32 (BF16/FP16 routing changes topk selection)
     topk_idx, weights = compute_deepseek_routing(
@@ -695,14 +784,18 @@ def kernel(
         N_GROUP=8,
         TOPK_GROUP=4,
     )
-    print(f"topk_idx shape: {topk_idx.shape}")
-    print(f"weights shape: {weights.shape}")
+    if _DEBUG:
+        print(f"topk_idx shape: {topk_idx.shape}")
+        print(f"weights shape: {weights.shape}")
 
     # Phase 1b/1c: Select which local experts were chosen
     # KEY OPTIMIZATION: Only dequantize weights for selected experts (~2-4x speedup)
     selected_global = torch.unique(topk_idx)  # [num_selected]
     selected_local = selected_global[(selected_global >= local_start) &
                                      (selected_global < local_start + E_local)] - local_start
+    if _DEBUG:
+        print(f"len(selected_global): {len(selected_global)}")
+        print(f"len(selected_local): {len(selected_local)}")
 
     if len(selected_local) == 0:
         # No local experts selected, return zeros
@@ -830,6 +923,7 @@ def main():
     parser.add_argument("--warmup", type=int, default=3, help="Number of warmup iterations")
     parser.add_argument("--profile", action="store_true", help="Run Kineto profiler on one kernel call")
     parser.add_argument("--profile-dir", type=str, default="./profiles", help="Directory to save Kineto trace JSON")
+    parser.add_argument("--debug", action="store_true", help="Enable diagnostic prints")
     parser.add_argument(
         "--act-dtype", type=str, default="bf16", choices=["bf16", "fp16", "fp32"],
         help="Activation dequantization dtype (dequantize_fp8_activations_xx)"
@@ -845,6 +939,11 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Propagate --debug to the module-level flag so kernel() picks it up too.
+    if args.debug:
+        import sys
+        sys.modules[__name__]._DEBUG = True
 
     # Load workload
     script_dir = Path(__file__).parent
@@ -922,19 +1021,13 @@ def main():
         H = 7168
         inputs["output"] = torch.zeros((seq_len, H), dtype=torch.bfloat16, device=device)
 
-        if not args.all_workloads:
+        if _DEBUG:
             print(f"\nInput shapes:")
             for key, value in inputs.items():
                 if isinstance(value, torch.Tensor):
                     print(f"  {key}: {value.shape} ({value.dtype})")
                 else:
                     print(f"  {key}: {value}")
-
-        # Run kernel
-        if not args.all_workloads:
-            print("\nRunning Helion-optimized kernel (FP8 → BF16 dequantization)...")
-            print("NOTE: Currently using PyTorch for expert computation")
-            print("      Helion kernel implementation is TODO")
 
         kernel_kwargs = dict(act_dtype=args.act_dtype, compute_dtype=args.compute_dtype)
 
@@ -1006,26 +1099,13 @@ def main():
                 print(f"{'TOTAL (self)':>55}  {_to_ms(cpu_m.group(1), cpu_m.group(2)):>12.3f}ms"
                       f"  {_to_ms(cuda_m.group(1), cuda_m.group(2)):>12.3f}ms")
 
-    print(f"\nOutput shape: {output.shape} ({output.dtype})")
-    print(f"Output stats:")
-    print(f"  Min: {output.min().item():.6f}")
-    print(f"  Max: {output.max().item():.6f}")
-    print(f"  Mean: {output.mean().item():.6f}")
-    print(f"  Std: {output.std().item():.6f}")
-
-    print("\n" + "="*80)
-    print("NEXT STEPS:")
-    print("="*80)
-    print("1. Run profiling on original kernel:")
-    print("   python moe_fp8fpX_fused.py --profile")
-    print("")
-    print("2. Implement Helion kernel for expert_computation_helion()")
-    print("   - Use hl.grid() to parallelize over token-expert pairs")
-    print("   - Use hl.tile() for tiled GEMM operations")
-    print("   - Use hl.atomic_add() for output accumulation")
-    print("")
-    print("3. Replace expert_computation_bf16() with Helion version")
-    print("="*80)
+    if _DEBUG:
+        print(f"\nOutput shape: {output.shape} ({output.dtype})")
+        print(f"Output stats:")
+        print(f"  Min: {output.min().item():.6f}")
+        print(f"  Max: {output.max().item():.6f}")
+        print(f"  Mean: {output.mean().item():.6f}")
+        print(f"  Std: {output.std().item():.6f}")
 
 
 if __name__ == "__main__":
