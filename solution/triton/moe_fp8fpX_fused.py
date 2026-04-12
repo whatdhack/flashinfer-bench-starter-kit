@@ -455,9 +455,8 @@ def _helion_fp8_gemm_tf32(
     return C
 
 
-# Autotune config — regenerate with config=None on first run.
-# block_sizes covers only the two free outer tiles (tile_m, tile_n);
-# tile_k and tile_h are fixed at 128 to match the fp8 scale block size.
+# Original config from commit 539e99b (pre-autotune, static_shapes=True).
+# Autotuned variants (autotune_local.py / autotune_modal.py) did not improve over this.
 hconfig_swiglu_fp32 = helion.Config(
     block_sizes=[32, 128],
     # 8 load/store ops: A, W13_val, S13_val, W13_gate, S13_gate, W2, S2, O(store)
@@ -599,6 +598,10 @@ def expert_computation_helion_fp32(
         S13_kexp     = S13_cache[le_int]             # [H//128, 2*I]
         S13_val_kexp  = S13_kexp[:, :I]              # [H//128, I] no copy
         S13_gate_kexp = S13_kexp[:, I:]              # [H//128, I] no copy
+
+        if _DEBUG:
+            print(f"DEBUG: le_int={le_int}, ge={ge}, start={start}, end={end}, token_idx={token_idx}")
+            print(f"DEBUG: A_e.shape={A_e.shape}, W13_val_t.shape={W13_val_t.shape}, W13_gate_t.shape={W13_gate_t.shape}, W2_t.shape={W2_t.shape}, S13_val_kexp.shape={S13_val_kexp.shape}, S13_gate_kexp.shape={S13_gate_kexp.shape}, S2_cache[le_int].shape={S2_cache[le_int].shape}")
 
         # Fused GEMM1 + SwiGLU + GEMM2: no [Te, I] intermediate in global memory
         O = _helion_fp8_swiglu_fused_fp32(

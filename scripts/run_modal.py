@@ -27,7 +27,7 @@ TRACE_SET_PATH = "/data"
 
 image = (
     modal.Image.debian_slim(python_version="3.12")
-    .pip_install("flashinfer-bench", "torch", "triton", "numpy")
+    .pip_install("flashinfer-bench", "torch", "triton", "numpy", "helion==1.0.0")
 )
 
 
@@ -103,7 +103,7 @@ def print_results(results: dict):
 
 
 @app.local_entrypoint()
-def main():
+def main(warmup_runs: int = 3, iterations: int = 100, num_trials: int = 5):
     """Pack solution and run benchmark on Modal."""
     from scripts.pack_solution import pack_solution
 
@@ -114,8 +114,14 @@ def main():
     solution = Solution.model_validate_json(solution_path.read_text())
     print(f"Loaded: {solution.name} ({solution.definition})")
 
-    print("\nRunning benchmark on Modal B200...")
-    results = run_benchmark.remote(solution)
+    config = BenchmarkConfig(
+        warmup_runs=warmup_runs,
+        iterations=iterations,
+        num_trials=num_trials,
+    )
+
+    print(f"\nRunning benchmark on Modal B200 (warmup={warmup_runs}, iterations={iterations}, trials={num_trials})...")
+    results = run_benchmark.remote(solution, config)
 
     if not results:
         print("No results returned!")
