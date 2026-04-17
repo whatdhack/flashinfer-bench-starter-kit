@@ -558,47 +558,42 @@ _TRITON_WEIGHT_CACHE: dict = {}
 
 
 def _get_triton_flat_weights(
-    W13_fp8: dict, W13_scale: dict,
-    W2_fp8: dict,  W2_scale: dict,
-    le_list: list,
+    gemm1_weights:       torch.Tensor,   # [E, 2*I, H]          fp8
+    gemm1_weights_scale: torch.Tensor,   # [E, 2*I//128, H//128] fp32
+    gemm2_weights:       torch.Tensor,   # [E, H,   I]          fp8
+    gemm2_weights_scale: torch.Tensor,   # [E, H//128, I//128]  fp32
+    le_list: list,                       # sorted local expert indices
 ):
     """
     Build (or retrieve from cache) the flat 2-D weight/scale tensors needed by
     _triton_fp8_grouped_swiglu_fused_fp32.
 
-    Scale layout is *compact*: [E*H//128, I//128] / [E*I//128, H//128] — one
-    float per 128×128 weight block, matching the FP8 spec.  The Triton kernel
-    indexes with  ``k_start // BLOCK_K``  and  ``pid_n``  (not the expanded
-    ``k_start`` / ``pid_n*128`` used before).
+    Uses a single permute+reshape per tensor (one GPU kernel each) instead of
+    a Python loop of per-expert .T.contiguous() calls followed by torch.cat.
 
-    Caching key: id(W13_fp8) + tuple(le_list).  Safe as long as the dict object
-    lives for the duration of the model (true for all standard inference loops).
+    Caching key: id(gemm1_weights) + tuple(le_list).
     """
-    cache_key = (id(W13_fp8), tuple(le_list))
+    cache_key = (id(gemm1_weights), tuple(le_list))
     if cache_key in _TRITON_WEIGHT_CACHE:
         return _TRITON_WEIGHT_CACHE[cache_key]
 
-    I = W2_fp8[le_list[0]].shape[1]
-    I_128 = I // 128
+    idx = torch.tensor(le_list, dtype=torch.long, device=gemm1_weights.device)
 
-    # ── Weight tensors ────────────────────────────────────────────────────────
-    # W13_fp8[le] shape: [2*I, H].  Transpose → [H, 2*I]: val at cols [:, :I],
-    # gate at cols [:, I:].  Keep combined; kernel addresses gate with +I offset.
-    W13_flat = torch.cat(
-        [W13_fp8[le].T.contiguous() for le in le_list], dim=0)   # [E*H, 2*I]
-    # W2_fp8[le] shape: [H, I].  Transpose → [I, H].
-    W2_flat = torch.cat(
-        [W2_fp8[le].T.contiguous() for le in le_list], dim=0)    # [E*I, H_out]
+    # gemm1_weights[idx]: [E_sel, 2*I, H] → permute(0,2,1) → [E_sel, H, 2*I]
+    #                      → reshape → [E_sel*H, 2*I]
+    W13_flat = gemm1_weights[idx].permute(0, 2, 1).reshape(-1, gemm1_weights.shape[1]).contiguous()
 
-    # ── Scale tensors: compact layout ─────────────────────────────────────────
-    # W13_scale[le] shape: [2*I//128, H//128].  Transpose → [H//128, 2*I//128]:
-    # val scales at cols [:, :I_128], gate scales at cols [:, I_128:].
-    # Keep combined; kernel addresses gate scales with +I_128 offset.
-    S13_flat = torch.cat(
-        [W13_scale[le].T.contiguous() for le in le_list], dim=0) # [E*H//128, 2*I//128]
-    # W2_scale[le] shape: [H//128, I//128].  Transpose → [I//128, H//128].
-    S2_flat = torch.cat(
-        [W2_scale[le].T.contiguous() for le in le_list], dim=0)  # [E*I//128, H//128]
+    # gemm1_weights_scale[idx]: [E_sel, 2*I//128, H//128] → permute → [E_sel, H//128, 2*I//128]
+    #                            → reshape → [E_sel*H//128, 2*I//128]
+    S13_flat = gemm1_weights_scale[idx].permute(0, 2, 1).reshape(-1, gemm1_weights_scale.shape[1]).contiguous()
+
+    # gemm2_weights[idx]: [E_sel, H, I] → permute(0,2,1) → [E_sel, I, H]
+    #                      → reshape → [E_sel*I, H]
+    W2_flat = gemm2_weights[idx].permute(0, 2, 1).reshape(-1, gemm2_weights.shape[1]).contiguous()
+
+    # gemm2_weights_scale[idx]: [E_sel, H//128, I//128] → permute → [E_sel, I//128, H//128]
+    #                            → reshape → [E_sel*I//128, H//128]
+    S2_flat = gemm2_weights_scale[idx].permute(0, 2, 1).reshape(-1, gemm2_weights_scale.shape[1]).contiguous()
 
     result = (W13_flat, S13_flat, W2_flat, S2_flat)
     _TRITON_WEIGHT_CACHE[cache_key] = result
@@ -847,26 +842,27 @@ def _triton_fp8_grouped_swiglu_fused_fp32(
 @torch.no_grad()
 def expert_computation_triton_grouped_fp32(
     A: torch.Tensor,
-    W13_fp8: dict,
-    W13_scale: dict,
-    W2_fp8: dict,
-    W2_scale: dict,
+    gemm1_weights:       torch.Tensor,   # [E_local, 2*I, H]          fp8
+    gemm1_weights_scale: torch.Tensor,   # [E_local, 2*I//128, H//128] fp32
+    gemm2_weights:       torch.Tensor,   # [E_local, H,   I]          fp8
+    gemm2_weights_scale: torch.Tensor,   # [E_local, H//128, I//128]  fp32
     topk_idx: torch.Tensor,
     weights: torch.Tensor,
     local_expert_offset: int,
     E_global: int,
+    selected_local: torch.Tensor,        # 1-D local expert indices that were chosen
 ) -> torch.Tensor:
     """
     Expert computation — single Triton grouped GEMM kernel (Scheme C, fp32).
 
-    Identical host-side logic to expert_computation_helion_grouped_fp32 but
-    calls _triton_fp8_grouped_swiglu_fused_fp32 instead of the Helion kernel,
-    bypassing Helion's data-dependent-slice limitation.
+    Accepts the raw stacked weight tensors directly (no per-expert dict), so the
+    caller skips the dict-building loop.  _get_triton_flat_weights uses a single
+    permute+reshape per tensor instead of E individual .T.contiguous() + cat.
     """
     T, H = A.shape
     device = A.device
     local_start = int(local_expert_offset)
-    le_list = sorted(W13_fp8.keys())
+    le_list = sorted(int(le.item()) for le in selected_local)
 
     prev_tf32 = torch.backends.cuda.matmul.allow_tf32
     torch.backends.cuda.matmul.allow_tf32 = False
@@ -887,7 +883,9 @@ def expert_computation_triton_grouped_fp32(
 
     # ── flat 2-D weight/scale tensors (cached across calls) ───────────────────
     W13_flat, S13_flat, W2_flat, S2_flat = _get_triton_flat_weights(
-        W13_fp8, W13_scale, W2_fp8, W2_scale, le_list)
+        gemm1_weights, gemm1_weights_scale,
+        gemm2_weights, gemm2_weights_scale,
+        le_list)
 
     # ── padded flat token arrays ──────────────────────────────────────────────
     flat_token_ids, flat_kernel_eids, flat_weights_list = [], [], []
@@ -1356,8 +1354,21 @@ def kernel(
         return output
 
     # Phase 3: Expert Computation
-    if compute_dtype in _FUSED_COMPUTE_DTYPES:
-        # Fused path: pass raw FP8 slices + scales; dequant happens inside the Helion kernel
+    if compute_dtype == 'triton_grouped_fp32':
+        # Fast path: pass stacked tensors directly — no per-expert dict loop.
+        if _DEBUG:
+            le0 = int(selected_local[0].item())
+            print(f"DEBUG weight shapes (le={le0}):")
+            print(f"  gemm1_weights      : {gemm1_weights[le0].shape}  {gemm1_weights.dtype}")
+            print(f"  gemm1_weights_scale: {gemm1_weights_scale[le0].shape}  {gemm1_weights_scale.dtype}")
+            print(f"  gemm2_weights      : {gemm2_weights[le0].shape}  {gemm2_weights.dtype}")
+            print(f"  gemm2_weights_scale: {gemm2_weights_scale[le0].shape}  {gemm2_weights_scale.dtype}")
+        temp_output = expert_computation_triton_grouped_fp32(
+            A, gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale,
+            topk_idx, weights, local_expert_offset, E_global, selected_local,
+        )
+    elif compute_dtype in _FUSED_COMPUTE_DTYPES:
+        # Helion fused path: build per-expert dicts, pass to helion kernel
         W13_fp8_dict  = {}
         W13_scale_dict = {}
         W2_fp8_dict   = {}
@@ -1368,6 +1379,14 @@ def kernel(
             W13_scale_dict[le_int] = gemm1_weights_scale[le_int]  # [2*I//128, H//128]
             W2_fp8_dict[le_int]    = gemm2_weights[le_int]        # [H, I]    fp8
             W2_scale_dict[le_int]  = gemm2_weights_scale[le_int]  # [H//128, I//128]
+
+        if _DEBUG:
+            le0 = next(iter(W13_fp8_dict))
+            print(f"DEBUG weight shapes (le={le0}):")
+            print(f"  W13_fp8  : {W13_fp8_dict[le0].shape}  {W13_fp8_dict[le0].dtype}")
+            print(f"  W13_scale: {W13_scale_dict[le0].shape}  {W13_scale_dict[le0].dtype}")
+            print(f"  W2_fp8   : {W2_fp8_dict[le0].shape}  {W2_fp8_dict[le0].dtype}")
+            print(f"  W2_scale : {W2_scale_dict[le0].shape}  {W2_scale_dict[le0].dtype}")
 
         temp_output = expert_computation(
             A, W13_fp8_dict, W13_scale_dict, W2_fp8_dict, W2_scale_dict,
