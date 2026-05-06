@@ -25,13 +25,27 @@ app = modal.App("flashinfer-bench")
 trace_volume = modal.Volume.from_name("flashinfer-trace", create_if_missing=True)
 TRACE_SET_PATH = "/data"
 
+jit_cache_volume = modal.Volume.from_name("flashinfer-jit-cache", create_if_missing=True)
+JIT_CACHE_PATH = "/root/.cache/flashinfer"
+
 image = (
-    modal.Image.debian_slim(python_version="3.12")
+    modal.Image.from_registry(
+        "nvidia/cuda:13.0.0-devel-ubuntu22.04",
+        add_python="3.12",
+    )
     .pip_install("flashinfer-bench", "torch", "triton", "numpy", "helion==1.0.0")
 )
 
 
-@app.function(image=image, gpu="B200:1", timeout=3600, volumes={TRACE_SET_PATH: trace_volume})
+@app.function(
+    image=image,
+    gpu="B200:1",
+    timeout=3600,
+    volumes={
+        TRACE_SET_PATH: trace_volume,
+        JIT_CACHE_PATH: jit_cache_volume,
+    },
+)
 def run_benchmark(solution: Solution, config: BenchmarkConfig = None) -> dict:
     """Run benchmark on Modal B200 and return results."""
     if config is None:
@@ -103,8 +117,19 @@ def print_results(results: dict):
 
 
 @app.local_entrypoint()
-def main(warmup_runs: int = 3, iterations: int = 100, num_trials: int = 5):
-    """Pack solution and run benchmark on Modal."""
+def main(
+    warmup_runs: int = 3,
+    iterations: int = 100,
+    num_trials: int = 5,
+    atol: float = 1e-2,
+    rtol: float = 1e-2,
+    required_matched_ratio: float = 0.0,
+):
+    """Pack solution and run benchmark on Modal.
+
+    Use contest tolerances for flashinfer-based solutions:
+      --atol 1 --rtol 0.3 --required-matched-ratio 0.9
+    """
     from scripts.pack_solution import pack_solution
 
     print("Packing solution from source files...")
@@ -118,9 +143,12 @@ def main(warmup_runs: int = 3, iterations: int = 100, num_trials: int = 5):
         warmup_runs=warmup_runs,
         iterations=iterations,
         num_trials=num_trials,
+        atol=atol,
+        rtol=rtol,
+        required_matched_ratio=required_matched_ratio if required_matched_ratio > 0 else None,
     )
 
-    print(f"\nRunning benchmark on Modal B200 (warmup={warmup_runs}, iterations={iterations}, trials={num_trials})...")
+    print(f"\nRunning benchmark on Modal B200 (warmup={warmup_runs}, iterations={iterations}, trials={num_trials}, atol={atol}, rtol={rtol})...")
     results = run_benchmark.remote(solution, config)
 
     if not results:

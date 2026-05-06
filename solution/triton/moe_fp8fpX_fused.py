@@ -458,6 +458,59 @@ def _helion_fp8_gemm_tf32(
     return C
 
 
+hconfig_fp8_native = helion.Config(
+    block_sizes=[64, 128],
+    # 5 tensor accesses: A (load), A_scale_T (load), W_t (load), S_kexp (load), C (store)
+    indexing=['pointer', 'pointer', 'pointer', 'pointer', 'pointer'],
+    l2_groupings=[32],
+    load_eviction_policies=['last', 'last', 'first', 'first'],
+    loop_orders=[[0, 1]],
+    num_stages=5,
+    num_warps=8,
+    pid_type='flat',
+    range_flattens=[None, False],
+    range_multi_buffers=[None, None],
+    range_num_stages=[0, 0],
+    range_unroll_factors=[0, 0],
+    range_warp_specializes=[None, False],
+)
+@helion.kernel(config=hconfig_fp8_native, static_shapes=True)
+def _helion_fp8_gemm_native(
+    A: torch.Tensor,          # [M, K]      fp8_e4m3fn activations (NOT pre-dequantized)
+    A_scale_T: torch.Tensor,  # [M, K//128] fp32 per-token per-block activation scales (transposed)
+    W_t: torch.Tensor,        # [K, N]      fp8_e4m3fn weights (transposed view)
+    S_kexp: torch.Tensor,     # [K//128, N] fp32 weight scales (pre-expanded, same as S_kexp in fp32/tf32 kernels)
+) -> torch.Tensor:            # [M, N]      fp32
+    """
+    Native FP8 tensor-core GEMM with per-128-element block scaling.
+
+    tile_k is fixed at 128 = BLOCK_SIZE so each K-tile covers exactly one scale block.
+    For each K-tile:
+      partial = dot(A_fp8_tile, W_fp8_tile)           # FP8 tensor cores, fp32 accumulator
+      acc    += partial * A_scale_T[m, k_s] * S_kexp[k_s, n]  # per-token × per-weight-block
+    """
+    M, K = A.shape
+    N = W_t.shape[1]
+    C = torch.empty([M, N], dtype=torch.float32, device=A.device)
+
+    for tile_m, tile_n in hl.tile([M, N]):
+        acc = hl.zeros([tile_m, tile_n], dtype=torch.float32)
+        for tile_k in hl.tile(K, block_size=128):
+            a_tile = A[tile_m, tile_k]                    # [bM, 128] fp8
+            w_tile = W_t[tile_k, tile_n]                  # [128, bN] fp8
+            k_s    = tile_k.begin // 128
+
+            partial = hl.dot(a_tile, w_tile)              # [bM, bN] fp32 via FP8 tensor cores
+
+            s_a = A_scale_T[tile_m, k_s : k_s + 1]       # [bM, 1]  per-token scale
+            s_w = S_kexp[k_s : k_s + 1, tile_n]          # [1, bN]  per-weight-block scale
+            acc = acc + partial * s_a * s_w               # broadcast → [bM, bN]
+
+        C[tile_m, tile_n] = acc
+
+    return C
+
+
 # Original config from commit 539e99b (pre-autotune, static_shapes=True).
 # Autotuned variants (autotune_local.py / autotune_modal.py) did not improve over this.
 hconfig_swiglu_fp32 = helion.Config(
@@ -538,67 +591,6 @@ def _helion_fp8_swiglu_fused_fp32(
     return O
 
 
-# Tile-M size for the grouped GEMM wrapper.  Each expert's token segment is
-# padded to a multiple of this value so no M-tile straddles an expert boundary.
-# Must match (or divide) the BM block size Helion actually chooses at compile
-# time.  64 is a safe default for H100/A100 fp8 workloads.
-_GROUPED_TILE_M = 64
-
-# Tile-M for the raw Triton grouped path.  32 halves register pressure vs 64
-# (BLOCK_M=64 needs ~768 fp32 regs/thread, pushing against H100's 256-reg limit
-# per warp; 32 fits comfortably and keeps better occupancy).
-_TRITON_GROUPED_TILE_M = 32
-
-# ── Module-level weight cache for triton_grouped_fp32 ─────────────────────────
-# Building the flat, contiguous weight tensors from the per-expert fp8 dicts
-# takes ~3 GB of D2D copies (all experts, val + gate + W2).  Since model weights
-# are constant across decode steps we cache them keyed by the identity of the
-# W13_fp8 dict (same dict object ⟹ same weights).
-_TRITON_WEIGHT_CACHE: dict = {}
-
-
-def _get_triton_flat_weights(
-    gemm1_weights:       torch.Tensor,   # [E, 2*I, H]          fp8
-    gemm1_weights_scale: torch.Tensor,   # [E, 2*I//128, H//128] fp32
-    gemm2_weights:       torch.Tensor,   # [E, H,   I]          fp8
-    gemm2_weights_scale: torch.Tensor,   # [E, H//128, I//128]  fp32
-    le_list: list,                       # sorted local expert indices
-):
-    """
-    Build (or retrieve from cache) the flat 2-D weight/scale tensors needed by
-    _triton_fp8_grouped_swiglu_fused_fp32.
-
-    Uses a single permute+reshape per tensor (one GPU kernel each) instead of
-    a Python loop of per-expert .T.contiguous() calls followed by torch.cat.
-
-    Caching key: id(gemm1_weights) + tuple(le_list).
-    """
-    cache_key = (id(gemm1_weights), tuple(le_list))
-    if cache_key in _TRITON_WEIGHT_CACHE:
-        return _TRITON_WEIGHT_CACHE[cache_key]
-
-    idx = torch.tensor(le_list, dtype=torch.long, device=gemm1_weights.device)
-
-    # gemm1_weights[idx]: [E_sel, 2*I, H] → permute(0,2,1) → [E_sel, H, 2*I]
-    #                      → reshape → [E_sel*H, 2*I]
-    W13_flat = gemm1_weights[idx].permute(0, 2, 1).reshape(-1, gemm1_weights.shape[1]).contiguous()
-
-    # gemm1_weights_scale[idx]: [E_sel, 2*I//128, H//128] → permute → [E_sel, H//128, 2*I//128]
-    #                            → reshape → [E_sel*H//128, 2*I//128]
-    S13_flat = gemm1_weights_scale[idx].permute(0, 2, 1).reshape(-1, gemm1_weights_scale.shape[1]).contiguous()
-
-    # gemm2_weights[idx]: [E_sel, H, I] → permute(0,2,1) → [E_sel, I, H]
-    #                      → reshape → [E_sel*I, H]
-    W2_flat = gemm2_weights[idx].permute(0, 2, 1).reshape(-1, gemm2_weights.shape[1]).contiguous()
-
-    # gemm2_weights_scale[idx]: [E_sel, H//128, I//128] → permute → [E_sel, I//128, H//128]
-    #                            → reshape → [E_sel*I//128, H//128]
-    S2_flat = gemm2_weights_scale[idx].permute(0, 2, 1).reshape(-1, gemm2_weights_scale.shape[1]).contiguous()
-
-    result = (W13_flat, S13_flat, W2_flat, S2_flat)
-    _TRITON_WEIGHT_CACHE[cache_key] = result
-    return result
-
 
 @helion.kernel(config=None, static_shapes=True)
 def _helion_fp8_grouped_swiglu_fused_fp32(
@@ -673,6 +665,54 @@ def _helion_fp8_grouped_swiglu_fused_fp32(
 
     return O
 
+# Tile-M size for the grouped GEMM wrapper.  Each expert's token segment is
+# padded to a multiple of this value so no M-tile straddles an expert boundary.
+# Must match (or divide) the BM block size Helion actually chooses at compile
+# time.  64 is a safe default for H100/A100 fp8 workloads.
+_GROUPED_TILE_M = 64
+
+# Tile-M for the raw Triton grouped path.  32 halves register pressure vs 64
+# (BLOCK_M=64 needs ~768 fp32 regs/thread, pushing against H100's 256-reg limit
+# per warp; 32 fits comfortably and keeps better occupancy).
+_TRITON_GROUPED_TILE_M = 64
+
+# ── Module-level weight cache for triton_grouped_fp32 ─────────────────────────
+# Building the flat, contiguous weight tensors from the per-expert fp8 dicts
+# takes ~3 GB of D2D copies (all experts, val + gate + W2).  Since model weights
+# are constant across decode steps we cache them keyed by the identity of the
+def _get_triton_flat_weights(
+    gemm1_weights:       torch.Tensor,   # [E, 2*I, H]          fp8
+    gemm1_weights_scale: torch.Tensor,   # [E, 2*I//128, H//128] fp32
+    gemm2_weights:       torch.Tensor,   # [E, H,   I]          fp8
+    gemm2_weights_scale: torch.Tensor,   # [E, H//128, I//128]  fp32
+    le_list: list,                       # sorted local expert indices
+):
+    """
+    Build the flat 2-D weight/scale tensors needed by
+    _triton_fp8_grouped_swiglu_fused_fp32.
+
+    Uses a single permute+reshape per tensor (one GPU kernel each) instead of
+    a Python loop of per-expert .T.contiguous() calls followed by torch.cat.
+    """
+    idx = torch.tensor(le_list, dtype=torch.long, device=gemm1_weights.device)
+
+    # gemm1_weights[idx]: [E_sel, 2*I, H] → permute(0,2,1) → [E_sel, H, 2*I]
+    #                      → reshape → [E_sel*H, 2*I]
+    W13_flat = gemm1_weights[idx].permute(0, 2, 1).reshape(-1, gemm1_weights.shape[1]).contiguous()
+
+    # gemm1_weights_scale[idx]: [E_sel, 2*I//128, H//128] → permute → [E_sel, H//128, 2*I//128]
+    #                            → reshape → [E_sel*H//128, 2*I//128]
+    S13_flat = gemm1_weights_scale[idx].permute(0, 2, 1).reshape(-1, gemm1_weights_scale.shape[1]).contiguous()
+
+    # gemm2_weights[idx]: [E_sel, H, I] → permute(0,2,1) → [E_sel, I, H]
+    #                      → reshape → [E_sel*I, H]
+    W2_flat = gemm2_weights[idx].permute(0, 2, 1).reshape(-1, gemm2_weights.shape[1]).contiguous()
+
+    # gemm2_weights_scale[idx]: [E_sel, H//128, I//128] → permute → [E_sel, I//128, H//128]
+    #                            → reshape → [E_sel*I//128, H//128]
+    S2_flat = gemm2_weights_scale[idx].permute(0, 2, 1).reshape(-1, gemm2_weights_scale.shape[1]).contiguous()
+
+    return (W13_flat, S13_flat, W2_flat, S2_flat)
 
 # =============================================================================
 # Raw Triton grouped GEMM (Scheme C) — avoids Helion's data-dependent-slice
@@ -700,13 +740,13 @@ def _triton_fp8_grouped_swiglu_kernel(
     stride_s2n,             # = H//128   (compact scales)
     stride_on,              # = H_out
     # ── tile sizes (compile-time) ──────────────────────────────────────────────
-    BLOCK_M: tl.constexpr,  # token tile  — must divide _GROUPED_TILE_M
-    BLOCK_N: tl.constexpr,  # H_out tile  — set to 128 (= FP8 scale block)
-    BLOCK_K: tl.constexpr,  # I tile      — set to 128 (= FP8 scale block)
-    BLOCK_H: tl.constexpr,  # H tile      — set to 128 (= FP8 scale block)
+    BLOCK_M: tl.constexpr,        # token tile  — must divide _GROUPED_TILE_M
+    SCALE_BLOCK_N: tl.constexpr,  # H_out tile  — set to 128 (= FP8 scale block)
+    SCALE_BLOCK_K: tl.constexpr,  # I tile      — set to 128 (= FP8 scale block)
+    SCALE_BLOCK_H: tl.constexpr,  # H tile      — set to 128 (= FP8 scale block)
 ):
     """
-    One CTA handles one [BLOCK_M, BLOCK_N] output tile.
+    One CTA handles one [BLOCK_M, SCALE_BLOCK_N] output tile.
 
     All BLOCK_M tokens share the same expert (input sorted+padded invariant).
     Expert id is loaded as a scalar; absolute offsets into flat 2-D weight/scale
@@ -714,10 +754,10 @@ def _triton_fp8_grouped_swiglu_kernel(
     that raw Triton handles but Helion's type propagation cannot.
 
     Scale structure: each 128×128 block of the weight matrix has one fp32 scale.
-    With BLOCK_H = BLOCK_K = BLOCK_N = 128 every tile maps to exactly one scale
-    block, so dequant is a single scalar load + multiply after tl.dot.
+    With SCALE_BLOCK_H = SCALE_BLOCK_K = SCALE_BLOCK_N = 128 every tile maps to
+    exactly one scale block, so dequant is a single scalar load + multiply after tl.dot.
     """
-    # Grid is (H_out//BLOCK_N, N//BLOCK_M): pid_0=N-tile varies fastest.
+    # Grid is (H_out//SCALE_BLOCK_N, N//BLOCK_M): pid_0=N-tile varies fastest.
     # CUDA launches CTAs in x-major order, so all 56 N-tiles for M-tile 0
     # (expert 0) start before M-tile 1.  This keeps the ~14 MB of weight tiles
     # per expert warm in the 24 MB L2 across all N-tiles, rather than loading
@@ -725,8 +765,8 @@ def _triton_fp8_grouped_swiglu_kernel(
     pid_n = tl.program_id(0)   # H_out tile — varies fastest → expert-major scheduling
     pid_m = tl.program_id(1)   # token-row (M) tile
 
-    offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)   # [BLOCK_M] token rows
-    offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)   # [BLOCK_N] output cols
+    offs_m = pid_m * BLOCK_M       + tl.arange(0, BLOCK_M)        # [BLOCK_M] token rows
+    offs_n = pid_n * SCALE_BLOCK_N + tl.arange(0, SCALE_BLOCK_N)  # [SCALE_BLOCK_N] output cols
 
     # Load expert index (scalar) — all tokens in this M-tile share one expert.
     le = tl.load(Eid_ptr + pid_m * BLOCK_M).to(tl.int32)
@@ -737,27 +777,27 @@ def _triton_fp8_grouped_swiglu_kernel(
     k_base   = le * I        # W2_flat    expert le rows start here
     k_s_base = le * I_128    # S2_flat    expert le scale rows start here
 
-    acc = tl.zeros((BLOCK_M, BLOCK_N), dtype=tl.float32)
+    acc = tl.zeros((BLOCK_M, SCALE_BLOCK_N), dtype=tl.float32)
 
     # ── outer loop: I-tiles (K-dim of GEMM2 / output-dim of GEMM1) ───────────
-    for k_start in range(0, I, BLOCK_K):
+    for k_start in range(0, I, SCALE_BLOCK_K):
         k_abs   = k_base   + k_start
-        k_s_abs = k_s_base + k_start // BLOCK_K  # scale row for this I-block
+        k_s_abs = k_s_base + k_start // SCALE_BLOCK_K  # scale row for this I-block
 
-        offs_k = k_start + tl.arange(0, BLOCK_K)
+        offs_k = k_start + tl.arange(0, SCALE_BLOCK_K)
 
-        g1_val  = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
-        g1_gate = tl.zeros((BLOCK_M, BLOCK_K), dtype=tl.float32)
+        g1_val  = tl.zeros((BLOCK_M, SCALE_BLOCK_K), dtype=tl.float32)
+        g1_gate = tl.zeros((BLOCK_M, SCALE_BLOCK_K), dtype=tl.float32)
 
         # ── inner loop: H-tiles (K-dim of GEMM1) ─────────────────────────────
-        for h_start in range(0, H, BLOCK_H):
+        for h_start in range(0, H, SCALE_BLOCK_H):
             h_abs   = h_base   + h_start
-            h_s_abs = h_s_base + h_start // BLOCK_H  # scale row for this H-block
+            h_s_abs = h_s_base + h_start // SCALE_BLOCK_H  # scale row for this H-block
 
-            offs_h_local = h_start + tl.arange(0, BLOCK_H)  # A  col indices (0-based in H)
-            offs_h_abs   = h_abs   + tl.arange(0, BLOCK_H)  # W13 row indices (absolute)
+            offs_h_local = h_start + tl.arange(0, SCALE_BLOCK_H)  # A  col indices (0-based in H)
+            offs_h_abs   = h_abs   + tl.arange(0, SCALE_BLOCK_H)  # W13 row indices (absolute)
 
-            # A tile [BLOCK_M, BLOCK_H] fp32
+            # A tile [BLOCK_M, BLOCK_H] fp32 — caller casts A_flat to fp32 before launch
             a_tile = tl.load(
                 A_ptr + offs_m[:, None] * stride_an + offs_h_local[None, :]
             )
@@ -766,29 +806,29 @@ def _triton_fp8_grouped_swiglu_kernel(
             w13v = tl.load(
                 W13_ptr + offs_h_abs[:, None] * stride_w13n + offs_k[None, :]
             ).to(tl.float32)
-            s13v = tl.load(S13_ptr + h_s_abs * stride_s13n + k_start // BLOCK_K)
-            g1_val = g1_val + tl.dot(a_tile, w13v) * s13v
+            s13v = tl.load(S13_ptr + h_s_abs * stride_s13n + k_start // SCALE_BLOCK_K)
+            g1_val = g1_val + tl.dot(a_tile, w13v, input_precision="tf32", out_dtype=tl.float32) * s13v
 
             w13g = tl.load(
                 W13_ptr + offs_h_abs[:, None] * stride_w13n + I + offs_k[None, :]
             ).to(tl.float32)
-            s13g = tl.load(S13_ptr + h_s_abs * stride_s13n + I_128 + k_start // BLOCK_K)
-            g1_gate = g1_gate + tl.dot(a_tile, w13g) * s13g
+            s13g = tl.load(S13_ptr + h_s_abs * stride_s13n + I_128 + k_start // SCALE_BLOCK_K)
+            g1_gate = g1_gate + tl.dot(a_tile, w13g, input_precision="tf32", out_dtype=tl.float32) * s13g
 
         # ── SwiGLU: val * SiLU(gate) ─────────────────────────────────────────
-        c_e = (g1_gate / (1.0 + tl.exp(-g1_gate))) * g1_val   # [BLOCK_M, BLOCK_K]
+        c_e = (g1_gate / (1.0 + tl.exp(-g1_gate))) * g1_val   # [BLOCK_M, SCALE_BLOCK_K]
 
         # ── GEMM2: c_e @ W2_tile, dequant by scalar s2 ───────────────────────
-        offs_k_abs = k_abs + tl.arange(0, BLOCK_K)
+        offs_k_abs = k_abs + tl.arange(0, SCALE_BLOCK_K)
 
         w2 = tl.load(
             W2_ptr + offs_k_abs[:, None] * stride_w2n + offs_n[None, :]
-        ).to(tl.float32)                                        # [BLOCK_K, BLOCK_N]
+        ).to(tl.float32)                                        # [SCALE_BLOCK_K, SCALE_BLOCK_N]
 
-        # compact scale: col index = pid_n (each pid_n covers exactly BLOCK_N=128 H_out cols)
+        # compact scale: col index = pid_n (each pid_n covers exactly SCALE_BLOCK_N=128 H_out cols)
         s2 = tl.load(S2_ptr + k_s_abs * stride_s2n + pid_n)
 
-        acc = acc + tl.dot(c_e, w2) * s2
+        acc = acc + tl.dot(c_e, w2, input_precision="tf32", out_dtype=tl.float32) * s2
 
     # ── store output ──────────────────────────────────────────────────────────
     tl.store(
@@ -813,14 +853,16 @@ def _triton_fp8_grouped_swiglu_fused_fp32(
 
     O = torch.empty((N, H_out), dtype=torch.float32, device=A_flat.device)
 
-    BLOCK_M = _TRITON_GROUPED_TILE_M  # 32 — halves register pressure vs 64
-    BLOCK_N = 128                     # = FP8 scale block → one scalar scale per N-tile
-    BLOCK_K = 128                     # = FP8 scale block → one scalar scale per K-tile
-    BLOCK_H = 128                     # = FP8 scale block → one scalar scale per H-tile
+    BLOCK_M       = _TRITON_GROUPED_TILE_M  # 64 — better occupancy on B200 vs 32
+    SCALE_BLOCK_N = 128                     # = FP8 scale block → one scalar scale per N-tile
+    SCALE_BLOCK_K = 128                     # = FP8 scale block → one scalar scale per K-tile
+    SCALE_BLOCK_H = 128                     # = FP8 scale block → one scalar scale per H-tile
 
-    # (H_out//BLOCK_N, N//BLOCK_M): pid_0 = N-tile varies fastest in CUDA,
+    # (H_out//SCALE_BLOCK_N, N//BLOCK_M): pid_0 = N-tile varies fastest in CUDA,
     # so all N-tiles for the same M-tile (expert) execute in the first wave.
-    grid = (triton.cdiv(H_out, BLOCK_N), triton.cdiv(N, BLOCK_M))
+    grid = (triton.cdiv(H_out, SCALE_BLOCK_N), triton.cdiv(N, BLOCK_M))
+    if _DEBUG:
+        print(f"[triton kernel] grid={grid}  total_CTAs={grid[0]*grid[1]}  N={N}  BLOCK_M={BLOCK_M}  H_out={H_out}")
 
     _triton_fp8_grouped_swiglu_kernel[grid](
         A_flat, expert_ids,
@@ -832,9 +874,9 @@ def _triton_fp8_grouped_swiglu_fused_fp32(
         W13_flat.stride(0), S13_flat.stride(0),
         W2_flat.stride(0),  S2_flat.stride(0),
         O.stride(0),
-        BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N,
-        BLOCK_K=BLOCK_K, BLOCK_H=BLOCK_H,
-        num_warps=8, num_stages=3,
+        BLOCK_M=BLOCK_M, SCALE_BLOCK_N=SCALE_BLOCK_N,
+        SCALE_BLOCK_K=SCALE_BLOCK_K, SCALE_BLOCK_H=SCALE_BLOCK_H,
+        num_warps=8, num_stages=2,
     )
     return O
 
@@ -920,7 +962,22 @@ def expert_computation_triton_grouped_fp32(
     kernel_expert_ids = torch.cat(flat_kernel_eids)
     w_flat            = torch.cat(flat_weights_list)
 
-    A_flat = A[local_token_ids]
+    if _DEBUG:
+        print(f"DEBUG expert_computation_triton_grouped_fp32 () flat token arrays:")
+        print(f"  local_token_ids   : {local_token_ids.shape}  {local_token_ids.dtype}")
+        print(f"  kernel_expert_ids : {kernel_expert_ids.shape}  {kernel_expert_ids.dtype}")
+        print(f"  w_flat            : {w_flat.shape}  {w_flat.dtype}")
+
+    A_flat = A[local_token_ids].to(torch.float32)  # kernel expects fp32; activations arrive as bf16
+
+    if _DEBUG:
+        print(f"DEBUG _triton_fp8_grouped_swiglu_fused_fp32 inputs:")
+        print(f"  A_flat            : {A_flat.shape}  {A_flat.dtype}")
+        print(f"  kernel_expert_ids : {kernel_expert_ids.shape}  {kernel_expert_ids.dtype}")
+        print(f"  W13_flat          : {W13_flat.shape}  {W13_flat.dtype}")
+        print(f"  S13_flat          : {S13_flat.shape}  {S13_flat.dtype}")
+        print(f"  W2_flat           : {W2_flat.shape}  {W2_flat.dtype}")
+        print(f"  S2_flat           : {S2_flat.shape}  {S2_flat.dtype}")
 
     # ── single Triton kernel launch ───────────────────────────────────────────
     O_flat = _triton_fp8_grouped_swiglu_fused_fp32(
@@ -1225,6 +1282,86 @@ def expert_computation_helion_tf32(
     return temp_output
 
 
+def expert_computation_helion_fp8(
+    A_fp8: torch.Tensor,        # [T, H]        fp8_e4m3fn  raw hidden_states (NOT dequantized)
+    A_scale: torch.Tensor,      # [H//128, T]   fp32        hidden_states_scale
+    W13_fp8: dict,              # {le_int: [2*I, H]}        fp8
+    W13_scale: dict,            # {le_int: [2*I//128, H//128]}  fp32
+    W2_fp8: dict,               # {le_int: [H, I]}          fp8
+    W2_scale: dict,             # {le_int: [H//128, I//128]}    fp32
+    topk_idx: torch.Tensor,
+    weights: torch.Tensor,
+    local_expert_offset: int,
+    E_global: int,
+) -> torch.Tensor:
+    """
+    Expert computation with native FP8 tensor cores for GEMM1.
+
+    Activations stay in FP8 — no dequantization.  Each K=128 tile of GEMM1 uses
+    FP8 tensor cores, then scales by A_scale[k_block, token] * W_scale[k_block, n_block].
+    GEMM2 uses FP32 C_e with on-chip FP8 weight dequant (same as helion_tf32).
+    """
+    T, H = A_fp8.shape
+    I_dim = next(iter(W2_fp8.values())).shape[1]
+    device = A_fp8.device
+    local_start = int(local_expert_offset)
+
+    prev_tf32 = torch.backends.cuda.matmul.allow_tf32
+    torch.backends.cuda.matmul.allow_tf32 = True
+
+    temp_output = torch.zeros((T, H), dtype=torch.float32, device=device)
+
+    TOP_K = topk_idx.shape[1]
+    token_ids_flat = torch.arange(T, device=device).unsqueeze(1).expand(-1, TOP_K).reshape(-1)
+    expert_ids_flat = topk_idx.reshape(-1)
+    sort_order = expert_ids_flat.argsort(stable=True)
+    sorted_token_ids = token_ids_flat[sort_order]
+    sorted_expert_ids = expert_ids_flat[sort_order]
+    expert_counts = torch.bincount(sorted_expert_ids, minlength=E_global)
+    expert_offsets_gpu = torch.zeros(E_global + 1, dtype=torch.long, device=device)
+    expert_offsets_gpu[1:] = expert_counts.cumsum(0)
+    expert_offsets_list = expert_offsets_gpu.cpu().tolist()
+
+    # Pre-expand weight scales: [N//128, K//128] → .T → repeat_interleave(128) → [K//128, N]
+    S13_cache = {le: torch.repeat_interleave(s.T.contiguous(), 128, dim=1) for le, s in W13_scale.items()}
+    S2_cache  = {le: torch.repeat_interleave(s.T.contiguous(), 128, dim=1) for le, s in W2_scale.items()}
+
+    # Transpose activation scale for easier per-token indexing in kernel:
+    # [H//128, T] → [T, H//128]  so A_scale_T[token, k_block] = scalar
+    A_scale_T = A_scale.T.contiguous()
+
+    for le_int, W13_e in W13_fp8.items():
+        ge = local_start + le_int
+        start = expert_offsets_list[ge]
+        end   = expert_offsets_list[ge + 1]
+        if start == end:
+            continue
+        token_idx = sorted_token_ids[start:end]
+
+        # Select expert tokens — keep FP8, no dequantization
+        A_e_fp8     = A_fp8.index_select(0, token_idx)         # [Te, H]       fp8
+        A_e_scale_T = A_scale_T.index_select(0, token_idx)     # [Te, H//128]  fp32
+
+        # GEMM1: FP8 × FP8 → FP32 (native FP8 tensor cores) — val and gate together
+        W13_t = W13_e.T                                         # [H, 2*I]  fp8
+        G1 = _helion_fp8_gemm_native(A_e_fp8, A_e_scale_T, W13_t, S13_cache[le_int])
+        # G1: [Te, 2*I]  fp32
+
+        # SwiGLU
+        X1, X2 = G1[:, :I_dim], G1[:, I_dim:]
+        C_e = (X2 / (1.0 + torch.exp(-X2))) * X1               # [Te, I]   fp32
+
+        # GEMM2: FP32 × FP8-dequant (helion_tf32 style — TF32 set above)
+        W2_t = W2_fp8[le_int].T                                 # [I, H]    fp8
+        O = _helion_fp8_gemm_tf32(C_e, W2_t, S2_cache[le_int]) # [Te, H]   fp32
+
+        w_tok = weights.index_select(0, token_idx)[:, ge]
+        temp_output.index_add_(0, token_idx, O * w_tok.unsqueeze(1))
+
+    torch.backends.cuda.matmul.allow_tf32 = prev_tf32
+    return temp_output
+
+
 # ===========================================
 # Main Kernel (Hybrid Approach)
 # ===========================================
@@ -1246,6 +1383,7 @@ _WEIGHT_DTYPE_MAP = {
     'helion_tf32': None,
     'helion_grouped_fp32': None,
     'triton_grouped_fp32': None,
+    'helion_fp8': None,    # native FP8 tensor cores; raw FP8 + scales passed directly
 }
 _WEIGHT_DEQUANT_SUFFIX = {
     'bf16': 'bf16',
@@ -1256,9 +1394,10 @@ _WEIGHT_DEQUANT_SUFFIX = {
     'helion_tf32': None,
     'helion_grouped_fp32': None,
     'triton_grouped_fp32': None,
+    'helion_fp8': None,
 }
 # compute_dtype values that skip the host-side weight dequant phase
-_FUSED_COMPUTE_DTYPES = {'helion_fp32', 'helion_tf32', 'helion_grouped_fp32', 'triton_grouped_fp32'}
+_FUSED_COMPUTE_DTYPES = {'helion_fp32', 'helion_tf32', 'helion_grouped_fp32', 'triton_grouped_fp32', 'helion_fp8'}
 
 
 @torch.no_grad()
@@ -1281,28 +1420,29 @@ def kernel(
 
     act_dtype:     controls dequantize_fp8_activations_{act_dtype}  (bf16 | fp16 | fp32)
     compute_dtype: controls dequantize_fp8_weights_{yy} + expert_computation_{compute_dtype}
-                   (bf16 | fp16 | fp32 | tf32 | helion_fp32 | helion_tf32)
+                   (bf16 | fp16 | fp32 | tf32 | helion_fp32 | helion_tf32 | helion_fp8)
 
-    When called by the benchmark runner (no kwargs), defaults to fp32 activations + helion_tf32.
+    When called by the benchmark runner (no kwargs), defaults to helion_fp8 (native FP8 tensor cores).
     """
     act_dtype     = kwargs.get('act_dtype', 'fp32')
-    compute_dtype = kwargs.get('compute_dtype', 'helion_tf32')
+    compute_dtype = kwargs.get('compute_dtype', 'helion_fp8')
     import sys
     _mod = sys.modules[__name__]
 
     if _DEBUG:
-        print(f"act_dtype={act_dtype}, compute_dtype={compute_dtype}")
-        print(f"routing_logits shape: {routing_logits.shape} ({routing_logits.dtype})")
-        print(f"routing_bias shape: {routing_bias.shape} ({routing_bias.dtype})")
-        print(f"hidden_states shape: {hidden_states.shape} ({hidden_states.dtype})")
-        print(f"hidden_states_scale shape: {hidden_states_scale.shape} ({hidden_states_scale.dtype})")
-        print(f"gemm1_weights shape: {gemm1_weights.shape} ({gemm1_weights.dtype})")
-        print(f"gemm1_weights_scale shape: {gemm1_weights_scale.shape} ({gemm1_weights_scale.dtype})")
-        print(f"gemm2_weights shape: {gemm2_weights.shape} ({gemm2_weights.dtype})")
-        print(f"gemm2_weights_scale shape: {gemm2_weights_scale.shape} ({gemm2_weights_scale.dtype})")
-        print(f"local_expert_offset: {local_expert_offset}")
-        print(f"routed_scaling_factor: {routed_scaling_factor}")
-        print(f"output shape: {output.shape} ({output.dtype})")
+        print(f"DEBUG kernel() input shapes:")
+        print(f"  act_dtype={act_dtype}, compute_dtype={compute_dtype}")
+        print(f"  routing_logits shape: {routing_logits.shape} ({routing_logits.dtype})")
+        print(f"  routing_bias shape: {routing_bias.shape} ({routing_bias.dtype})")
+        print(f"  hidden_states shape: {hidden_states.shape} ({hidden_states.dtype})")
+        print(f"  hidden_states_scale shape: {hidden_states_scale.shape} ({hidden_states_scale.dtype})")
+        print(f"  gemm1_weights shape: {gemm1_weights.shape} ({gemm1_weights.dtype})")
+        print(f"  gemm1_weights_scale shape: {gemm1_weights_scale.shape} ({gemm1_weights_scale.dtype})")
+        print(f"  gemm2_weights shape: {gemm2_weights.shape} ({gemm2_weights.dtype})")
+        print(f"  gemm2_weights_scale shape: {gemm2_weights_scale.shape} ({gemm2_weights_scale.dtype})")
+        print(f"  local_expert_offset: {local_expert_offset}")
+        print(f"  routed_scaling_factor: {routed_scaling_factor}")
+        print(f"  output shape: {output.shape} ({output.dtype})")
 
     # Constants
     H = 7168
@@ -1322,9 +1462,9 @@ def kernel(
         weight_dequant_fn = getattr(_mod, f'dequantize_fp8_weights_{w_suffix}')
 
     # Phase 1a: Dequantize activations FP8 → act_dtype
-    A = act_dequant_fn(hidden_states, hidden_states_scale, BLOCK)
-    if _DEBUG:
-        print(f"A dtype: {A.dtype}, shape: {A.shape}")
+    # helion_fp8 skips dequantization — raw FP8 hidden_states passed directly to expert fn
+    if compute_dtype != 'helion_fp8':
+        A = act_dequant_fn(hidden_states, hidden_states_scale, BLOCK)
 
     # Phase 2: Routing (Host-side) — keep in FP32 (BF16/FP16 routing changes topk selection)
     topk_idx, weights = compute_deepseek_routing(
@@ -1336,8 +1476,9 @@ def kernel(
         TOPK_GROUP=4,
     )
     if _DEBUG:
-        print(f"topk_idx shape: {topk_idx.shape}")
-        print(f"weights shape: {weights.shape}")
+        print(f"DEBUG kernel() routing output:")
+        print(f"  topk_idx shape: {topk_idx.shape}")
+        print(f"  weights shape: {weights.shape}")
 
     # Phase 1b/1c: Select which local experts were chosen
     # KEY OPTIMIZATION: Only dequantize weights for selected experts (~2-4x speedup)
@@ -1345,8 +1486,9 @@ def kernel(
     selected_local = selected_global[(selected_global >= local_start) &
                                      (selected_global < local_start + E_local)] - local_start
     if _DEBUG:
-        print(f"len(selected_global): {len(selected_global)}")
-        print(f"len(selected_local): {len(selected_local)}")
+        print(f"DEBUG kernel() expert selection:")
+        print(f"  len(selected_global): {len(selected_global)}")
+        print(f"  len(selected_local): {len(selected_local)}")
 
     if len(selected_local) == 0:
         # No local experts selected, return zeros
@@ -1358,14 +1500,40 @@ def kernel(
         # Fast path: pass stacked tensors directly — no per-expert dict loop.
         if _DEBUG:
             le0 = int(selected_local[0].item())
-            print(f"DEBUG weight shapes (le={le0}):")
+            print(f"DEBUG kernel() activations:")
+            print(f"  A                  : {A.shape}  {A.dtype}")
+            print(f"DEBUG kernel() weight shapes (le={le0}):")
             print(f"  gemm1_weights      : {gemm1_weights[le0].shape}  {gemm1_weights.dtype}")
             print(f"  gemm1_weights_scale: {gemm1_weights_scale[le0].shape}  {gemm1_weights_scale.dtype}")
             print(f"  gemm2_weights      : {gemm2_weights[le0].shape}  {gemm2_weights.dtype}")
             print(f"  gemm2_weights_scale: {gemm2_weights_scale[le0].shape}  {gemm2_weights_scale.dtype}")
+            print(f"DEBUG kernel() routing:")
+            print(f"  topk_idx       : {topk_idx.shape}  {topk_idx.dtype}")
+            print(f"  weights        : {weights.shape}  {weights.dtype}")
+            print(f"  local_expert_offset: {local_expert_offset}")
+            print(f"  E_global       : {E_global}")
+            print(f"  selected_local : {selected_local.shape}  values={selected_local.tolist()}")
         temp_output = expert_computation_triton_grouped_fp32(
             A, gemm1_weights, gemm1_weights_scale, gemm2_weights, gemm2_weights_scale,
             topk_idx, weights, local_expert_offset, E_global, selected_local,
+        )
+    elif compute_dtype == 'helion_fp8':
+        # Native FP8 path: activations stay in FP8, no dequantization
+        W13_fp8_dict  = {}
+        W13_scale_dict = {}
+        W2_fp8_dict   = {}
+        W2_scale_dict  = {}
+        for le in selected_local:
+            le_int = int(le.item())
+            W13_fp8_dict[le_int]   = gemm1_weights[le_int]
+            W13_scale_dict[le_int] = gemm1_weights_scale[le_int]
+            W2_fp8_dict[le_int]    = gemm2_weights[le_int]
+            W2_scale_dict[le_int]  = gemm2_weights_scale[le_int]
+
+        temp_output = expert_computation_helion_fp8(
+            hidden_states, hidden_states_scale,
+            W13_fp8_dict, W13_scale_dict, W2_fp8_dict, W2_scale_dict,
+            topk_idx, weights, local_expert_offset, E_global,
         )
     elif compute_dtype in _FUSED_COMPUTE_DTYPES:
         # Helion fused path: build per-expert dicts, pass to helion kernel

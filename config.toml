@@ -5,8 +5,14 @@ author = "whatdhack"              # Team/author name
 path = "./solution"
 
 [build]
-language = "triton"               # triton | cuda
-#entry_point = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.py::kernel"    
+language = "cuda"               # triton | cuda | python
+#entry_point = "moe_fp8_block_scale_ds_routing_topk8_ng8_kg4_e32_h7168_i2048.py::kernel"
 #entry_point = "moe_fp8bf16_local_e_dq.py::kernel"          # Kernel function name
-entry_point = "moe_fp8fpX_fused.py::kernel"
-destination_passing_style = true  # Use destination-passing style (default: true)
+#entry_point = "moe_fp8fpX_fused.py::kernel"
+#destination_passing_style = true  # kernel() writes into output tensor and returns it
+#entry_point = "flashinfer_wrapper.py::run"
+#destination_passing_style = false  # flashinfer_wrapper.py::run returns the tensor directly
+#entry_point = "gpt-5-2025-08-07-moe_fp8_fused.py::run"
+entry_point = "gpt-5-2025-08-07-moe-fp8-fused-main.cpp::run"
+destination_passing_style = false  # run() returns the tensor directly
+binding = "torch"
