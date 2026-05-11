@@ -1,3 +1,7 @@
+import argparse
+import os
+import time
+from datetime import datetime
 import torch
 
 
@@ -168,10 +172,10 @@ def run(
     return output.to(torch.bfloat16)
 
 
-def main():
+def main(num_iterations: int = 20, warmup_iters: int = 5, profile_iters: int = 3, profile: bool = False):
     device = "cuda" if torch.cuda.is_available() else "cpu"
 
-    T = 7          # number of tokens
+    T = 57          # number of tokens
     H = 7168
     I = 2048
     E_local = 32 # El
@@ -183,6 +187,7 @@ def main():
     num_gemm1_out_blocks = (2 * I) // SCALE_BLOCK  # 32
 
     print(f"Device: {device}  |  T={T}, H={H}, I={I}, E_local={E_local}, E_global={E_global}")
+    print(f"Iterations: {warmup_iters} warmup + {num_iterations} timed" + (f", profiling last {profile_iters}" if profile else ""))
     print("Allocating inputs...")
 
     routing_logits = torch.randn(T, E_global, device=device)
@@ -197,21 +202,80 @@ def main():
     gemm2_weights_scale = torch.ones(E_local, num_hidden_blocks, num_intermediate_blocks, device=device)
 
     local_expert_offset = 0
-    routed_scaling_factor = 1.0
+    routed_scaling_factor = 2.5
 
-    print("Running...")
-    output = run(
-        routing_logits=routing_logits,
-        routing_bias=routing_bias,
-        hidden_states=hidden_states,
-        hidden_states_scale=hidden_states_scale,
-        gemm1_weights=gemm1_weights,
-        gemm1_weights_scale=gemm1_weights_scale,
-        gemm2_weights=gemm2_weights,
-        gemm2_weights_scale=gemm2_weights_scale,
-        local_expert_offset=local_expert_offset,
-        routed_scaling_factor=routed_scaling_factor,
-    )
+    def _run_once():
+        return run(
+            routing_logits=routing_logits,
+            routing_bias=routing_bias,
+            hidden_states=hidden_states,
+            hidden_states_scale=hidden_states_scale,
+            gemm1_weights=gemm1_weights,
+            gemm1_weights_scale=gemm1_weights_scale,
+            gemm2_weights=gemm2_weights,
+            gemm2_weights_scale=gemm2_weights_scale,
+            local_expert_offset=local_expert_offset,
+            routed_scaling_factor=routed_scaling_factor,
+        )
+
+    print(f"Warming up ({warmup_iters} iterations)...")
+    for _ in range(warmup_iters):
+        output = _run_once()
+    if device == "cuda":
+        torch.cuda.synchronize()
+
+    def _timed_run():
+        if device == "cuda":
+            start_ev = torch.cuda.Event(enable_timing=True)
+            end_ev = torch.cuda.Event(enable_timing=True)
+            start_ev.record()
+            out = _run_once()
+            end_ev.record()
+            torch.cuda.synchronize()
+            return out, start_ev.elapsed_time(end_ev) / 1e3  # ms → s
+        t0 = time.perf_counter()
+        out = _run_once()
+        return out, time.perf_counter() - t0
+
+    times: list[float] = []
+    non_profile_iters = num_iterations - profile_iters if profile else num_iterations
+
+    print(f"Running {non_profile_iters} timed iteration(s)...")
+    for _ in range(non_profile_iters):
+        output, elapsed = _timed_run()
+        times.append(elapsed)
+
+    if profile:
+        print(f"Profiling last {profile_iters} iterations...")
+        with torch.profiler.profile(
+            activities=[
+                torch.profiler.ProfilerActivity.CPU,
+                *(
+                    [torch.profiler.ProfilerActivity.CUDA]
+                    if device == "cuda"
+                    else []
+                ),
+            ],
+            record_shapes=True,
+            with_stack=False,
+        ) as prof:
+            for i in range(profile_iters):
+                with torch.profiler.record_function(f"run_iter_{i+non_profile_iters+warmup_iters}"):
+                    output, elapsed = _timed_run()
+                times.append(elapsed)
+                prof.step()
+
+        print(prof.key_averages().table(sort_by="cuda_time_total" if device == "cuda" else "cpu_time_total", row_limit=20))
+
+        os.makedirs("profiles", exist_ok=True)
+        fn = os.path.splitext(os.path.basename(__file__))[0]
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        trace_path = os.path.join("profiles", f"{fn}_{ts}.json")
+        prof.export_chrome_trace(trace_path)
+        print(f"Chrome trace saved to {trace_path}")
+
+    avg_ms = (sum(times) / len(times)) * 1e3
+    print(f"Average iteration time ({len(times)} iters): {avg_ms:.3f} ms")
 
     print(f"Output shape : {output.shape}")
     print(f"Output dtype : {output.dtype}")
@@ -219,4 +283,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description="MoE FP8 reference benchmark")
+    parser.add_argument("--num-iterations", type=int, default=20, help="Number of timed iterations (default: 20)")
+    parser.add_argument("--warmup-iters", type=int, default=5, help="Number of warmup iterations (default: 5)")
+    parser.add_argument("--profile-iters", type=int, default=3, help="Number of tail iterations to profile (default: 3)")
+    parser.add_argument("--profile", action="store_true", help="Enable profiling on the last --profile-iters iterations")
+    args = parser.parse_args()
+    main(num_iterations=args.num_iterations, warmup_iters=args.warmup_iters, profile_iters=args.profile_iters, profile=args.profile)
